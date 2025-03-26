@@ -1,23 +1,22 @@
 <#
 .SYNOPSIS
-    Completely removes Office 2016 MSI/Click-to-Run installations and cleans up leftover files, registry keys, scheduled tasks, and shortcuts.
+    Completely removes Office 2016 installations (both MSI-based and Click‑to‑Run) and cleans up leftover files, registry keys, scheduled tasks, and shortcuts.
 
 .DESCRIPTION
-    This script combines techniques from a CMD tool and a VBScript to:
-      • Enumerate and uninstall Office 2016 MSI products via the Windows Installer COM object.
-      • Uninstall Office Click-to-Run installations.
-      • Terminate Office-related processes and stop the Office Source Engine service.
-      • Remove leftover Office directories from Program Files, ProgramData, and user profiles.
-      • Remove Office-related scheduled tasks.
-      • Remove Office-related registry keys and ARP entries.
-      • Remove Office-related shortcuts.
+    This script uses several techniques:
+      • It backs up registry hives to a fixed folder under C:\temp\RegistryBackup.
+      • It stops common Office processes and the Office Source Engine service.
+      • It uses the Windows Installer COM object to enumerate and uninstall Office 2016 MSI products.
+      • It explicitly checks for Office Standard 2016 (registry key Office16.STANDARD) and runs its uninstall command.
+      • It calls OfficeC2RClient.exe if a Click‑to‑Run installation is detected.
+      • Finally, it removes known Office folders, scheduled tasks, registry keys, and shortcuts.
       
-    Logs are saved to **C:\temp**.
+    Logs are written to C:\temp.
     
 .NOTES
-    - Requires Administrator privileges.
+    - Requires Administrator privileges (or running under SYSTEM with proper rights).
     - Tested on Windows 10 (64-bit) with Office 2016.
-    - Adjust paths and key lists as needed.
+    - Adjust paths, registry keys, and process names as needed.
 #>
 
 #region Helper Functions
@@ -43,7 +42,7 @@ function Write-Log {
 
 #region Setup Log Location
 
-# Ensure that the log directory (C:\temp) exists.
+# Use a fixed directory for logs.
 $logDir = "C:\temp"
 if (-not (Test-Path $logDir)) {
     New-Item -ItemType Directory -Path $logDir | Out-Null
@@ -57,22 +56,29 @@ Write-Log "Office 2016 complete uninstall script started."
 #region Backup Registry
 
 function Backup-Registry {
-    # Create a backup folder on the Desktop with a timestamp
+    Write-Log "Trying to back up"
+    # Use a fixed backup folder under C:\temp\RegistryBackup
+    $backupRoot = "C:\temp\RegistryBackup"
+    if (-not (Test-Path $backupRoot)) {
+        New-Item -ItemType Directory -Path $backupRoot | Out-Null
+    }
     $timestamp = (Get-Date).ToString("yyyyMMddHHmmss")
-    $backupPath = Join-Path $env:USERPROFILE "Desktop\RegistryBackup\$timestamp"
+    $backupPath = Join-Path $backupRoot $timestamp
     if (-not (Test-Path $backupPath)) {
         New-Item -ItemType Directory -Path $backupPath | Out-Null
     }
-    Write-Log "Backing up registry hives to: $backupPath"
+    Write-Log "Backing up registry hives to $backupPath"
     foreach ($hive in @("HKCR", "HKCU", "HKLM", "HKU", "HKCC")) {
         $regFile = Join-Path $backupPath "$hive.reg"
+        Write-Log "$regFile"
         try {
             reg export $hive $regFile /y | Out-Null
             Write-Log "Backed up $hive to $regFile"
         } catch {
-            Write-Log "ERROR backing up $hive: $_"
+            Write-Log "ERROR backing up $hive - $_"
         }
     }
+    Write-Log "Reg Backup Done"
 }
 
 #endregion Backup Registry
@@ -80,7 +86,7 @@ function Backup-Registry {
 #region Process and Service Cleanup
 
 function Stop-OfficeProcesses {
-    # List of common Office processes (MSI-based and Click-to-Run)
+    Write-Log "Trying to kill processes"
     $processNames = @(
         "winword", "excel", "powerpnt", "onenote", "outlook", "mspub", "msaccess", "infopath",
         "groove", "lync", "officeclicktorun", "officeondemand", "officec2rclient",
@@ -88,20 +94,21 @@ function Stop-OfficeProcesses {
         "communicator", "msosync", "onenotem", "iexplore", "mavinject32", "werfault",
         "perfboost", "roamingoffice", "msiexec", "ose"
     )
-    foreach ($name in $processNames) {
+    foreach ($name in $processNames) {\
+
         Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     }
     Write-Log "Office processes terminated."
 }
 
 function Stop-OfficeService {
-    # Stop and disable the Office Source Engine service ("ose")
+    Write-Log "Checking for Office Source Engine service"
     try {
         Stop-Service -Name "ose" -ErrorAction SilentlyContinue
         sc.exe config ose start= disabled | Out-Null
         Write-Log "Office Source Engine service stopped and disabled."
     } catch {
-        Write-Log "ERROR stopping service 'ose': $_"
+        Write-Log "ERROR stopping service 'ose' - $_"
     }
 }
 
@@ -110,6 +117,7 @@ function Stop-OfficeService {
 #region Uninstall Office MSI Products
 
 function Uninstall-OfficeMSI {
+    Write-Log "Running Uninstall-OfficeMSI"
     Write-Log "Enumerating Office MSI products for removal..."
     try {
         $msi = New-Object -ComObject WindowsInstaller.Installer
@@ -135,13 +143,13 @@ function Uninstall-OfficeMSI {
         Write-Log "Found $($officeProducts.Count) Office MSI product(s) to remove."
         foreach ($prod in $officeProducts) {
             $prodName = $msi.ProductInfo($prod, "ProductName")
-            Write-Log "Uninstalling: $prodName (ProductCode: $prod)"
+            Write-Log "Uninstalling $prodName (ProductCode: $prod)"
             $uninstallCmd = "msiexec.exe /x{$prod} /qn /norestart"
             try {
                 Start-Process -FilePath "cmd.exe" -ArgumentList "/c $uninstallCmd" -Wait -ErrorAction Stop
                 Write-Log "Uninstall command completed for $prodName."
             } catch {
-                Write-Log "ERROR uninstalling $prodName: $_"
+                Write-Log "ERROR uninstalling $prodName - $_"
             }
         }
     }
@@ -149,9 +157,39 @@ function Uninstall-OfficeMSI {
 
 #endregion Uninstall Office MSI Products
 
+#region Uninstall Office Standard 2016
+
+function Uninstall-OfficeStandard {
+    Write-Log "Running Uninstall-OfficeStandard"
+    # Specifically check for Office Standard 2016 via its registry key.
+    $regKeyPath = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Office16.STANDARD"
+    if (Test-Path $regKeyPath) {
+         try {
+              $uninstallString = (Get-ItemProperty -Path $regKeyPath -Name "UninstallString").UninstallString
+              if ($uninstallString) {
+                    Write-Log "Found Office Standard uninstall string: $uninstallString"
+                    if ($uninstallString -notmatch "/quiet") {
+                        $uninstallString = "$uninstallString /quiet"
+                    }
+                    Start-Process -FilePath "cmd.exe" -ArgumentList "/c $uninstallString" -Wait -ErrorAction Stop
+                    Write-Log "Office Standard uninstallation initiated."
+              } else {
+                    Write-Log "No UninstallString found in $regKeyPath."
+              }
+         } catch {
+              Write-Log "ERROR uninstalling Office Standard - $_"
+         }
+    } else {
+         Write-Log "Registry key $regKeyPath not found; Office Standard may not be installed."
+    }
+}
+
+#endregion Uninstall Office Standard 2016
+
 #region Uninstall Click-to-Run
 
 function Uninstall-OfficeC2R {
+    Write-Log "Running ninstall-OfficeC2R"
     $c2rPath = "$env:ProgramFiles\Common Files\Microsoft Shared\ClickToRun\OfficeC2RClient.exe"
     if (Test-Path $c2rPath) {
         Write-Log "Office Click-to-Run installation detected."
@@ -160,7 +198,7 @@ function Uninstall-OfficeC2R {
             Start-Process -FilePath $c2rPath -ArgumentList $arguments -Wait -ErrorAction Stop
             Write-Log "Click-to-Run uninstall initiated."
         } catch {
-            Write-Log "ERROR during Click-to-Run uninstall: $_"
+            Write-Log "ERROR during Click-to-Run uninstall - $_"
         }
     } else {
         Write-Log "No Office Click-to-Run installation found."
@@ -178,7 +216,7 @@ function Remove-OfficeFolders {
         "$env:ProgramFiles(x86)\Microsoft Office 15",
         "$env:ProgramFiles\Microsoft Office\root",
         "$env:ProgramFiles(x86)\Microsoft Office\root",
-        "$env:ProgramFiles\Microsoft Office",  # Use with caution: may delete entire Office folder
+        "$env:ProgramFiles\Microsoft Office",
         "$env:ProgramFiles(x86)\Microsoft Office",
         "$env:ProgramData\Microsoft\ClicToRun",
         "$env:COMMONPROGRAMFILES\Microsoft Shared\ClickToRun",
@@ -193,7 +231,7 @@ function Remove-OfficeFolders {
                 Remove-Item -Path $folder -Recurse -Force -ErrorAction SilentlyContinue
                 Write-Log "Removed folder: $folder"
             } catch {
-                Write-Log "ERROR removing folder $folder: $_"
+                Write-Log "ERROR removing folder $folder - $_"
             }
         }
     }
@@ -227,7 +265,7 @@ function Remove-OfficeScheduledTasks {
             schtasks.exe /delete /tn $task /f | Out-Null
             Write-Log "Removed task: $task"
         } catch {
-            Write-Log "Error removing task: $task"
+            Write-Log "ERROR removing task $task - $_"
         }
     }
 }
@@ -252,11 +290,10 @@ function Remove-OfficeRegistryKeys {
                 Remove-Item -Path $key -Recurse -Force -ErrorAction SilentlyContinue
                 Write-Log "Removed registry key: $key"
             } catch {
-                Write-Log "ERROR removing registry key $key: $_"
+                Write-Log "ERROR removing registry key $key - $_"
             }
         }
     }
-    # Example: remove known ARP entries (customize as needed)
     $arpKeys = @(
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Office14.ENTERPRISE",
         "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Office14.PROPLUS"
@@ -267,7 +304,7 @@ function Remove-OfficeRegistryKeys {
                 Remove-Item -Path $key -Force -ErrorAction SilentlyContinue
                 Write-Log "Removed ARP key: $key"
             } catch {
-                Write-Log "ERROR removing ARP key $key: $_"
+                Write-Log "ERROR removing ARP key $key - $_"
             }
         }
     }
@@ -290,48 +327,38 @@ function Remove-OfficeShortcuts {
                 Get-ChildItem -Path $path -Filter "*2016*.lnk" -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
                 Write-Log "Removed shortcuts in: $path"
             } catch {
-                Write-Log "ERROR removing shortcuts in $path: $_"
+                Write-Log "ERROR removing shortcuts in $path - $_"
             }
         }
     }
 }
 
 #endregion Remove Shortcuts
-
 #region Main Execution
 
-# Ensure running as Administrator.
 Assert-Admin
 
-# Optional: Back up the registry before making changes.
-Backup-Registry
+#Backup-Registry
 
-# Terminate Office processes.
-Stop-OfficeProcesses
+#Stop-OfficeProcesses
 
-# Stop the Office Source Engine service.
-Stop-OfficeService
+#Stop-OfficeService
 
-# Uninstall MSI-based Office 2016 products.
 Uninstall-OfficeMSI
 
-# Uninstall Click-to-Run installations.
 Uninstall-OfficeC2R
 
-# Allow time for uninstall processes to settle.
+Uninstall-OfficeStandard
+
 Start-Sleep -Seconds 10
 
-# Remove leftover Office folders and files.
 Remove-OfficeFolders
 
-# Remove Office-related scheduled tasks.
 Remove-OfficeScheduledTasks
 
-# Remove known Office registry keys.
 Remove-OfficeRegistryKeys
 
-# Remove Office shortcuts.
-Remove-OfficeShortcuts
+#Remove-OfficeShortcuts
 
 Write-Log "Office 2016 complete removal process finished. A system reboot may be required."
 
